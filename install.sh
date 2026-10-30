@@ -63,7 +63,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
         read -p "Student ID cannot be empty: " USERNAME
     done
 
-    read -s -p "Wi-Fi Password: " PASSWORD
+    read -s -p "Password: " PASSWORD
     echo ""
     while [[ -z "$PASSWORD" ]]; do
         read -s -p "Password cannot be empty: " PASSWORD
