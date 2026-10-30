@@ -1,0 +1,18 @@
+#compdef inha-wifi iut-wifi
+
+_inha_wifi() {
+    local -a commands
+    commands=(
+        'status:Show current Wi-Fi, authentication, and daemon status'
+        'login:Force immediate login check and authentication'
+        'logout:Log out of the captive portal (useful for testing)'
+        'start:Install and start background auto-login daemon'
+        'stop:Stop the background daemon'
+        'restart:Restart the background daemon'
+        'logs:View real-time daemon logs (tail -f)'
+        'config:View or update credentials (~/.config/inha-wifi/config.json)'
+    )
+    _describe -t commands 'command' commands
+}
+
+_inha_wifi "$@"

@@ -1,0 +1,28 @@
+# Sensitive configuration
+config.json
+state.json
+*.log
+*.err
+*.pid
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
+*~

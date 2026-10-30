@@ -1,0 +1,9 @@
+{
+  "username": "YOUR_STUDENT_ID",
+  "password": "YOUR_WIFI_PASSWORD",
+  "check_interval_seconds": 30,
+  "keepalive_interval_seconds": 60,
+  "wifi_interface": "en0",
+  "preferred_ssids": ["Inha", "IUT"],
+  "show_notifications": true
+}

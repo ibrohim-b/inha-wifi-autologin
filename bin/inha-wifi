@@ -1,0 +1,783 @@
+#!/usr/bin/env python3
+"""
+Automated Captive Portal Login & Keep-Alive Daemon for Inha / IUT Wi-Fi
+Works on macOS for networks "Inha" (Dormitory) and "IUT" (Campus).
+FortiGate Captive Portal (/fgtauth & /keepalive) automation.
+"""
+
+import sys
+import os
+import re
+import time
+import json
+import ssl
+import signal
+import subprocess
+import urllib.request
+import urllib.parse
+import urllib.error
+import http.cookiejar
+import logging
+import getpass
+
+CONFIG_DIR = os.path.expanduser("~/.config/inha-wifi")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+STATE_PATH = os.path.join(CONFIG_DIR, "state.json")
+LOG_PATH = os.path.join(CONFIG_DIR, "daemon.log")
+PLIST_PATH = os.path.expanduser("~/Library/LaunchAgents/uz.inha.wifi-autologin.plist")
+
+DEFAULT_CONFIG = {
+    "username": "",
+    "password": "",
+    "check_interval_seconds": 30,
+    "keepalive_interval_seconds": 60,
+    "wifi_interface": "en0",
+    "preferred_ssids": ["Inha", "IUT"],
+    "show_notifications": True
+}
+
+# Known gateway hosts
+KNOWN_PORTALS = {
+    "172.18.10.1": "gwd.inha.uz:1003",       # Dormitory
+    "192.168.31.254": "gw-iut.inha.uz:1003", # Campus
+}
+
+PROBE_DOMAINS = {
+    "captive.apple.com",
+    "detectportal.firefox.com",
+    "firefox-portal-detection.com",
+    "neverssl.com",
+    "apple.com",
+    "connectivitycheck.gstatic.com",
+    "msftconnecttest.com",
+    "google.com"
+}
+
+def interactive_setup():
+    """Prompt user interactively to configure credentials."""
+    print("=" * 48)
+    print("   INHA / IUT WI-FI SETUP")
+    print("=" * 48)
+    print("Credentials are stored locally in ~/.config/inha-wifi/config.json (chmod 600).\n")
+    try:
+        username = input("Enter your Student ID (e.g. U2610...): ").strip()
+        while not username:
+            username = input("Student ID cannot be empty: ").strip()
+
+        password = getpass.getpass("Enter your Wi-Fi Password: ").strip()
+        while not password:
+            password = getpass.getpass("Password cannot be empty: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nSetup cancelled.")
+        sys.exit(1)
+
+    cfg = DEFAULT_CONFIG.copy()
+    cfg["username"] = username
+    cfg["password"] = password
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG_PATH, 0o600)
+    print(f"\n✅ Configuration saved to {CONFIG_PATH}\n")
+    return cfg
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        if sys.stdin.isatty():
+            return interactive_setup()
+        else:
+            logging.error(f"Config file not found at {CONFIG_PATH}. Please run 'inha-wifi config' to set credentials.")
+            return DEFAULT_CONFIG
+
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+            merged = DEFAULT_CONFIG.copy()
+            merged.update(cfg)
+            if not merged.get("username") or not merged.get("password"):
+                if sys.stdin.isatty():
+                    return interactive_setup()
+            return merged
+    except Exception as e:
+        logging.error(f"Failed to read config from {CONFIG_PATH}: {e}")
+        return DEFAULT_CONFIG
+
+def load_state():
+    if os.path.exists(STATE_PATH):
+        try:
+            with open(STATE_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"keepalive_token": None, "portal_host": None, "last_login": 0}
+
+def save_state(state):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(STATE_PATH, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Failed to save state: {e}")
+
+def notify(title, message, enabled=True):
+    if not enabled:
+        return
+    try:
+        escaped_title = title.replace('"', '\\"')
+        escaped_msg = message.replace('"', '\\"')
+        cmd = f'display notification "{escaped_msg}" with title "{escaped_title}"'
+        subprocess.run(["osascript", "-e", cmd], capture_output=True, timeout=3)
+    except Exception:
+        pass
+
+def get_ssl_context():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+def setup_urllib():
+    ctx = get_ssl_context()
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    urllib.request.install_opener(opener)
+
+def get_default_gateway():
+    try:
+        out = subprocess.check_output(
+            "route -n get default 2>/dev/null | awk '/gateway:/ {print $2}'",
+            shell=True, text=True, timeout=2
+        ).strip()
+        return out if out else None
+    except Exception:
+        return None
+
+def get_wifi_ip(interface="en0"):
+    try:
+        out = subprocess.check_output(
+            ["ipconfig", "getifaddr", interface],
+            stderr=subprocess.DEVNULL, text=True, timeout=2
+        ).strip()
+        return out if out else None
+    except Exception:
+        return None
+
+def check_internet():
+    """
+    Checks if device has real internet access.
+    Returns: (is_online, redirect_url, page_content)
+    """
+    test_urls = [
+        "http://firefox-portal-detection.com/generate_204",
+        "http://captive.apple.com/hotspot-detect.html",
+        "http://neverssl.com"
+    ]
+    for url in test_urls:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0"}
+            )
+            ctx = get_ssl_context()
+            with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
+                final_url = resp.geturl()
+                content = resp.read().decode("utf-8", errors="ignore")
+                
+                # If captive portal redirected to https://gwd.inha.uz... or similar
+                if "inha.uz" in final_url or "fgtauth" in final_url or "keepalive" in final_url:
+                    return False, final_url, content
+                
+                if resp.status == 204 or "Success" in content:
+                    return True, final_url, content
+                
+                # Intercepted HTML without redirect (FortiGate serving portal script on port 80)
+                if "inha" in content.lower() or "fgtauth" in content.lower() or "welcome to iut" in content.lower():
+                    return False, final_url, content
+
+        except urllib.error.HTTPError as e:
+            # Captive portal 302/303 redirection
+            loc = e.headers.get("Location")
+            content = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
+            if loc and ("inha.uz" in loc or "fgtauth" in loc):
+                return False, loc, content
+            if loc:
+                return False, loc, content
+        except Exception:
+            pass
+            
+    return False, None, ""
+
+def extract_portal_info(redirect_url, html_content, gateway):
+    """
+    Extracts (portal_host, magic_token) from captive portal redirection.
+    Guarantees portal_host is never a probe domain.
+    """
+    portal_host = None
+    magic_token = None
+
+    # 1. Search HTML for inha.uz hostname
+    if html_content:
+        inha_match = re.search(r'https?://([a-zA-Z0-9.-]+\.inha\.uz(?::\d+)?)', html_content)
+        if inha_match:
+            portal_host = inha_match.group(1)
+
+    # 2. Check redirect_url if not a probe domain
+    if not portal_host and redirect_url:
+        parsed = urllib.parse.urlparse(redirect_url)
+        host = parsed.netloc
+        if host:
+            is_probe = any(probe in host.lower() for probe in PROBE_DOMAINS)
+            if not is_probe and "inha.uz" in host:
+                portal_host = host
+
+    # 3. Use default gateway mapping
+    if not portal_host:
+        if gateway in KNOWN_PORTALS:
+            portal_host = KNOWN_PORTALS[gateway]
+        elif gateway and gateway.startswith("172.18."):
+            portal_host = "gwd.inha.uz:1003"
+        elif gateway and gateway.startswith("192.168."):
+            portal_host = "gw-iut.inha.uz:1003"
+        else:
+            portal_host = "gwd.inha.uz:1003"
+
+    if ":" not in portal_host:
+        portal_host += ":1003"
+
+    # 4. Extract magic token
+    to_search = []
+    if html_content:
+        to_search.append(html_content)
+    if redirect_url:
+        to_search.append(redirect_url)
+
+    for text in to_search:
+        # Check query string like /fgtauth?00497603dade32b1
+        m = re.search(r'fgtauth\?([a-fA-F0-9]{16})', text)
+        if m:
+            magic_token = m.group(1)
+            break
+        # Check <input ... name="magic" value="...">
+        m = re.search(r'name=["\']magic["\']\s+value=["\']([a-fA-F0-9]+)["\']', text)
+        if m:
+            magic_token = m.group(1)
+            break
+        # General query match: magic=...
+        m = re.search(r'[?&]magic=([a-fA-F0-9]+)', text)
+        if m:
+            magic_token = m.group(1)
+            break
+
+    return portal_host, magic_token
+
+def perform_login(portal_host, magic_token, username, password):
+    """
+    FortiGate captive portal login sequence:
+    1. Send GET request to https://{portal_host}/fgtauth?{magic_token} to initialize
+       the session in FortiGate's authd and fetch the HTML login form.
+    2. Extract hidden inputs and form action (usually action="/").
+    3. Send POST request to https://{portal_host}/ with credentials.
+    4. Extract keepalive token from response.
+    """
+    ctx = get_ssl_context()
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx),
+        urllib.request.HTTPCookieProcessor(cookie_jar)
+    )
+
+    portal_get_url = f"https://{portal_host}/fgtauth?{magic_token}"
+    logging.info(f"Visiting captive portal page: {portal_get_url}")
+    
+    login_html = ""
+    browser_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # STEP 1: GET /fgtauth?<magic>
+    try:
+        req = urllib.request.Request(portal_get_url, headers=browser_headers)
+        with opener.open(req, timeout=8) as resp:
+            login_html = resp.read().decode("utf-8", errors="ignore")
+            logging.info(f"Loaded portal page successfully ({len(login_html)} bytes).")
+    except Exception as e:
+        logging.warning(f"GET to {portal_get_url} returned: {e}")
+
+    # STEP 2: Parse form action and hidden fields
+    form_action = "/"
+    form_inputs = {}
+    if login_html:
+        m_form = re.search(r'<form\b[^>]*>', login_html, re.I)
+        if m_form:
+            act_m = re.search(r'action=["\']([^"\']*)["\']', m_form.group(0), re.I)
+            if act_m and act_m.group(1).strip():
+                form_action = act_m.group(1).strip()
+
+        hidden_inputs = re.findall(r'<input\b[^>]+type=["\']hidden["\'][^>]*>', login_html, re.I)
+        for inp in hidden_inputs:
+            name_m = re.search(r'name=["\']([^"\']+)["\']', inp, re.I)
+            val_m = re.search(r'value=["\']([^"\']*)["\']', inp, re.I)
+            if name_m:
+                form_inputs[name_m.group(1)] = val_m.group(1) if val_m else ""
+
+    # Determine POST URL
+    if form_action.startswith("http://") or form_action.startswith("https://"):
+        post_url = form_action
+    else:
+        act = form_action if form_action.startswith("/") else "/" + form_action
+        post_url = f"https://{portal_host}{act}"
+
+    logging.info(f"Submitting credentials to POST {post_url} ...")
+
+    # STEP 3: POST credentials
+    payload = form_inputs.copy()
+    payload["magic"] = magic_token
+    payload["username"] = username
+    payload["password"] = password
+    if "4Tredir" not in payload:
+        payload["4Tredir"] = "http://captive.apple.com/hotspot-detect.html"
+
+    encoded_data = urllib.parse.urlencode(payload).encode("utf-8")
+    post_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": f"https://{portal_host}",
+        "Referer": portal_get_url,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+
+    targets = [post_url]
+    if post_url != f"https://{portal_host}/":
+        targets.append(f"https://{portal_host}/")
+
+    last_error = None
+    for target in targets:
+        try:
+            req = urllib.request.Request(target, data=encoded_data, headers=post_headers, method="POST")
+            with opener.open(req, timeout=10) as resp:
+                resp_data = resp.read().decode("utf-8", errors="ignore")
+                final_url = resp.geturl()
+                
+                # Check for keepalive token
+                tokens = re.findall(r'keepalive\?([a-fA-F0-9]+)', resp_data)
+                if not tokens:
+                    tokens = re.findall(r'keepalive\?([a-fA-F0-9]+)', final_url)
+                
+                keepalive_token = tokens[0] if tokens else None
+                return True, keepalive_token, resp_data
+
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location")
+            if loc and "keepalive" in loc:
+                m = re.search(r'keepalive\?([a-fA-F0-9]+)', loc)
+                return True, (m.group(1) if m else None), ""
+            if e.code in (302, 303, 307):
+                return True, None, ""
+            last_error = e
+        except Exception as e:
+            last_error = e
+
+    return False, None, str(last_error)
+
+def perform_logout(state, cfg):
+    """
+    Logs out of captive portal to release the firewall session (useful for testing).
+    """
+    portal_host = state.get("portal_host")
+    token = state.get("keepalive_token")
+    gateway = get_default_gateway()
+    if not portal_host or any(probe in portal_host for probe in PROBE_DOMAINS):
+        portal_host = KNOWN_PORTALS.get(gateway, "gwd.inha.uz:1003")
+
+    print(f"Logging out from captive portal ({portal_host})...")
+    urls = []
+    if token:
+        urls.append(f"https://{portal_host}/logout?{token}")
+    urls.append(f"https://{portal_host}/logout")
+
+    ctx = get_ssl_context()
+    for url in urls:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+            )
+            with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
+                pass
+        except Exception:
+            pass
+
+    state["keepalive_token"] = None
+    save_state(state)
+    time.sleep(2)
+    is_online, redir, _ = check_internet()
+    if not is_online:
+        print("✅ Successfully logged out! Captive portal is now active.")
+        return True
+    else:
+        print("Logout signal sent.")
+        return True
+
+def ping_keepalive(portal_host, token):
+    """
+    Refreshes session timeout so it doesn't expire.
+    """
+    if not portal_host or not token:
+        return False, None
+    url = f"https://{portal_host}/keepalive?{token}"
+    ctx = get_ssl_context()
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+            data = resp.read().decode("utf-8", errors="ignore")
+            tokens = re.findall(r'keepalive\?([a-fA-F0-9]+)', data)
+            new_token = tokens[0] if tokens else token
+            return True, new_token
+    except Exception as e:
+        logging.debug(f"Keepalive ping failed: {e}")
+        return False, token
+
+def ensure_wifi_connected(cfg):
+    """
+    If no IP address on Wi-Fi, attempt connection to preferred SSIDs.
+    """
+    interface = cfg.get("wifi_interface", "en0")
+    ip = get_wifi_ip(interface)
+    if ip:
+        return True
+    
+    ssids = cfg.get("preferred_ssids", ["Inha", "IUT"])
+    for ssid in ssids:
+        logging.info(f"Wi-Fi disconnected. Attempting association with '{ssid}' on {interface}...")
+        try:
+            subprocess.run(
+                ["networksetup", "-setairportnetwork", interface, ssid],
+                capture_output=True, timeout=10
+            )
+            time.sleep(3)
+            if get_wifi_ip(interface):
+                logging.info(f"Successfully associated with '{ssid}'!")
+                return True
+        except Exception as e:
+            logging.warning(f"Error associating with '{ssid}': {e}")
+            
+    return get_wifi_ip(interface) is not None
+
+def run_login_sequence(cfg, state):
+    """
+    Full login check & execute routine.
+    """
+    if not cfg.get("username") or not cfg.get("password"):
+        logging.error("Wi-Fi credentials are not configured. Run 'inha-wifi config' to set them.")
+        return False
+
+    # 1. Ensure Wi-Fi has an IP
+    if not ensure_wifi_connected(cfg):
+        logging.warning("Wi-Fi has no IP address. Is Wi-Fi turned on and within range?")
+        return False
+
+    # 2. Check if already online
+    is_online, redir_url, content = check_internet()
+    if is_online:
+        logging.info("Already authenticated! Internet access is fully functional.")
+        if state.get("portal_host") and state.get("keepalive_token"):
+            ok, new_tok = ping_keepalive(state["portal_host"], state["keepalive_token"])
+            if ok:
+                state["keepalive_token"] = new_tok
+                save_state(state)
+        return True
+
+    logging.info(f"Captive portal detected! URL: {redir_url}")
+    gateway = get_default_gateway()
+    portal_host, magic = extract_portal_info(redir_url, content, gateway)
+
+    if not magic:
+        logging.info("Probing portal to obtain magic token...")
+        try:
+            req = urllib.request.Request(
+                "http://neverssl.com",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=4, context=get_ssl_context()) as resp:
+                data = resp.read().decode("utf-8", errors="ignore")
+                _, magic = extract_portal_info(resp.geturl(), data, gateway)
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location")
+            if loc:
+                _, magic = extract_portal_info(loc, "", gateway)
+        except Exception as e:
+            logging.debug(f"Failed to probe neverssl: {e}")
+
+    if not magic:
+        logging.error(f"Could not obtain captive portal magic token from {portal_host}.")
+        return False
+
+    logging.info(f"Authenticating with portal {portal_host} (user: {cfg['username']}, magic: {magic})...")
+    success, keepalive_tok, resp_data = perform_login(
+        portal_host, magic, cfg["username"], cfg["password"]
+    )
+
+    # Verify connection
+    time.sleep(1)
+    is_online, _, _ = check_internet()
+    if is_online or success:
+        logging.info(f"Authentication SUCCESSFUL! Keepalive token: {keepalive_tok}")
+        state["portal_host"] = portal_host
+        state["keepalive_token"] = keepalive_tok
+        state["last_login"] = int(time.time())
+        save_state(state)
+
+        location_label = "Dormitory" if "gwd" in portal_host else "Campus"
+        notify("Inha / IUT Wi-Fi", f"Connected & Authenticated ({location_label})", cfg.get("show_notifications", True))
+        return True
+    else:
+        logging.error(f"Login attempt failed. Response snippet: {resp_data[:200]}")
+        return False
+
+def daemon_loop(cfg):
+    """
+    Main loop for background LaunchAgent service.
+    """
+    logging.info("Starting Inha/IUT Wi-Fi background autologin service...")
+    setup_urllib()
+    state = load_state()
+    
+    # Try to grab current keepalive token from existing session if state is empty
+    if not state.get("keepalive_token") and get_default_gateway() in KNOWN_PORTALS:
+        state["portal_host"] = KNOWN_PORTALS[get_default_gateway()]
+        try:
+            ff_hist = os.path.expanduser("~/Library/Application Support/Firefox/Profiles")
+            for root, dirs, files in os.walk(ff_hist):
+                if "places.sqlite" in files:
+                    db_path = os.path.join(root, "places.sqlite")
+                    tmp_db = "/tmp/places_tmp.sqlite"
+                    subprocess.run(["cp", db_path, tmp_db], capture_output=True)
+                    cmd = f"sqlite3 '{tmp_db}' \"SELECT url FROM moz_places WHERE url LIKE '%keepalive%' ORDER BY last_visit_date DESC LIMIT 1;\" 2>/dev/null"
+                    out = subprocess.check_output(cmd, shell=True, text=True).strip()
+                    try:
+                        os.remove(tmp_db)
+                    except Exception:
+                        pass
+                    m = re.search(r'keepalive\?([a-fA-F0-9]+)', out)
+                    if m:
+                        state["keepalive_token"] = m.group(1)
+                        save_state(state)
+                        logging.info(f"Recovered keepalive token from Firefox history: {state['keepalive_token']}")
+                        break
+        except Exception as e:
+            logging.debug(f"History recovery error: {e}")
+
+    last_check_time = 0
+    last_keepalive_time = 0
+    check_interval = cfg.get("check_interval_seconds", 30)
+    keepalive_interval = cfg.get("keepalive_interval_seconds", 60)
+
+    while True:
+        now = time.time()
+        
+        # 1. Keepalive ping (keeps session alive so it never expires)
+        if state.get("portal_host") and state.get("keepalive_token"):
+            if now - last_keepalive_time >= keepalive_interval:
+                last_keepalive_time = now
+                ok, new_tok = ping_keepalive(state["portal_host"], state["keepalive_token"])
+                if ok:
+                    logging.debug("Keepalive ping OK.")
+                    if new_tok != state["keepalive_token"]:
+                        state["keepalive_token"] = new_tok
+                        save_state(state)
+                else:
+                    logging.debug("Keepalive failed; testing connectivity...")
+                    is_online, _, _ = check_internet()
+                    if not is_online:
+                        run_login_sequence(cfg, state)
+
+        # 2. General connectivity check
+        if now - last_check_time >= check_interval:
+            last_check_time = now
+            is_online, _, _ = check_internet()
+            if not is_online:
+                logging.info("Internet check failed or session dropped. Triggering login sequence...")
+                run_login_sequence(cfg, state)
+
+        time.sleep(5)
+
+# --- Service Management ---
+
+def create_launchd_plist():
+    binary_path = os.path.expanduser("~/.local/bin/inha-wifi")
+    if not os.path.exists(binary_path):
+        binary_path = os.path.abspath(__file__)
+
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>uz.inha.wifi-autologin</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>{binary_path}</string>
+        <string>--daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{LOG_PATH}</string>
+    <key>StandardErrorPath</key>
+    <string>{LOG_PATH}</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+"""
+    os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
+    with open(PLIST_PATH, "w") as f:
+        f.write(plist_content)
+    logging.info(f"Created LaunchAgent at {PLIST_PATH}")
+
+def start_service():
+    create_launchd_plist()
+    subprocess.run(["launchctl", "unload", PLIST_PATH], stderr=subprocess.DEVNULL)
+    res = subprocess.run(["launchctl", "load", PLIST_PATH], capture_output=True, text=True)
+    if res.returncode == 0:
+        print("✅ Inha/IUT Wi-Fi background autologin service STARTED.")
+        print(f"📄 Logs: {LOG_PATH}")
+    else:
+        print(f"❌ Failed to load LaunchAgent: {res.stderr}")
+
+def stop_service():
+    if os.path.exists(PLIST_PATH):
+        res = subprocess.run(["launchctl", "unload", PLIST_PATH], capture_output=True, text=True)
+        if res.returncode == 0:
+            print("🛑 Background autologin service STOPPED.")
+        else:
+            print(f"Status: {res.stderr.strip() if res.stderr else 'Already stopped.'}")
+    else:
+        print("Service is not installed.")
+
+def print_status():
+    cfg = load_config()
+    setup_urllib()
+    state = load_state()
+    interface = cfg.get("wifi_interface", "en0")
+    ip = get_wifi_ip(interface)
+    gateway = get_default_gateway()
+    
+    print("=" * 45)
+    print("   INHA / IUT WI-FI AUTOMATION STATUS")
+    print("=" * 45)
+    print(f"Wi-Fi Interface : {interface}")
+    print(f"IP Address     : {ip if ip else 'Disconnected'}")
+    print(f"Gateway Router : {gateway if gateway else 'Unknown'}")
+    
+    if gateway in KNOWN_PORTALS:
+        location = "Dormitory" if "gwd" in KNOWN_PORTALS[gateway] else "Campus"
+        print(f"Location       : {location} ({KNOWN_PORTALS[gateway]})")
+    else:
+        print(f"Location       : External / Other network")
+        
+    is_online, redir, _ = check_internet()
+    if is_online:
+        print("Internet State : 🟢 Connected & Authorized")
+    else:
+        print(f"Internet State : 🔴 Intercepted / Captive Portal ({redir or 'Offline'})")
+
+    if state.get("keepalive_token"):
+        print(f"Keepalive Token: {state['keepalive_token']}")
+    if state.get("last_login"):
+        lt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state["last_login"]))
+        print(f"Last Login     : {lt}")
+
+    # LaunchAgent status
+    launchctl_out = subprocess.run(
+        "launchctl list | grep uz.inha.wifi-autologin",
+        shell=True, capture_output=True, text=True
+    ).stdout.strip()
+    if launchctl_out:
+        print(f"Daemon Service : 🟢 Running (PID: {launchctl_out.split()[0]})")
+    else:
+        print("Daemon Service : ⚪ Stopped (Run 'inha-wifi start' to enable)")
+    print("=" * 45)
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
+        logging.basicConfig(
+            filename=LOG_PATH,
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        cfg = load_config()
+        daemon_loop(cfg)
+        return
+
+    # CLI mode
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    cmd = sys.argv[1].lower() if len(sys.argv) > 1 else "status"
+
+    if cmd in ("login", "auth"):
+        cfg = load_config()
+        setup_urllib()
+        state = load_state()
+        print("🔍 Checking Wi-Fi and captive portal...")
+        success = run_login_sequence(cfg, state)
+        sys.exit(0 if success else 1)
+
+    elif cmd == "logout":
+        cfg = load_config()
+        setup_urllib()
+        state = load_state()
+        perform_logout(state, cfg)
+
+    elif cmd == "status":
+        print_status()
+
+    elif cmd == "start":
+        start_service()
+
+    elif cmd == "stop":
+        stop_service()
+
+    elif cmd == "restart":
+        stop_service()
+        time.sleep(1)
+        start_service()
+
+    elif cmd in ("log", "logs"):
+        if os.path.exists(LOG_PATH):
+            os.system(f"tail -n 40 -f '{LOG_PATH}'")
+        else:
+            print(f"No logs found yet at {LOG_PATH}")
+
+    elif cmd in ("config", "edit", "setup"):
+        if sys.stdin.isatty():
+            interactive_setup()
+        else:
+            print(f"Config path: {CONFIG_PATH}")
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r") as f:
+                    print(f.read())
+
+    else:
+        print("""Usage: inha-wifi [command]
+
+Commands:
+  status   Show current Wi-Fi, authentication, and daemon status (default)
+  login    Force immediate login check and authentication
+  logout   Log out of the captive portal session (useful for testing)
+  start    Install and start the background auto-login daemon
+  stop     Stop the background daemon
+  restart  Restart the background daemon
+  logs     View real-time daemon logs (tail -f)
+  config   View or update credentials (~/.config/inha-wifi/config.json)
+""")
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+    main()
