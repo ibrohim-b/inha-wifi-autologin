@@ -35,7 +35,7 @@ This tool runs as a lightweight, native macOS **LaunchAgent** daemon that runs i
 Open Terminal and run:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/inha-wifi-autologin.git
+git clone https://github.com/ibrohim-b/inha-wifi-autologin.git
 cd inha-wifi-autologin
 chmod +x install.sh
 ./install.sh
