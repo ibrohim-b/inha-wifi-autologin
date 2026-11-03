@@ -137,6 +137,16 @@ def get_ssl_context():
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """
+    HTTP redirect handler that intercepts redirects instead of following them.
+    This allows capturing 301/302/303/307 captive portal redirection headers
+    directly without following the redirect into FortiGate's port 1003 HTTPS endpoint,
+    preventing connection resets (RemoteDisconnected) and preserving magic tokens.
+    """
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
 def setup_urllib():
     ctx = get_ssl_context()
     opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
@@ -168,18 +178,21 @@ def check_internet():
     Returns: (is_online, redirect_url, page_content)
     """
     test_urls = [
-        "http://firefox-portal-detection.com/generate_204",
         "http://captive.apple.com/hotspot-detect.html",
+        "http://firefox-portal-detection.com/generate_204",
+        "http://connectivitycheck.gstatic.com/generate_204",
         "http://neverssl.com"
     ]
+    ctx = get_ssl_context()
+    opener = urllib.request.build_opener(NoRedirectHandler(), urllib.request.HTTPSHandler(context=ctx))
+
     for url in test_urls:
         try:
             req = urllib.request.Request(
                 url,
                 headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0"}
             )
-            ctx = get_ssl_context()
-            with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
+            with opener.open(req, timeout=4) as resp:
                 final_url = resp.geturl()
                 content = resp.read().decode("utf-8", errors="ignore")
                 
@@ -195,11 +208,9 @@ def check_internet():
                     return False, final_url, content
 
         except urllib.error.HTTPError as e:
-            # Captive portal 302/303 redirection
+            # Captive portal 301/302/303/307 redirection intercepted cleanly
             loc = e.headers.get("Location")
             content = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
-            if loc and ("inha.uz" in loc or "fgtauth" in loc):
-                return False, loc, content
             if loc:
                 return False, loc, content
         except Exception:
@@ -433,11 +444,13 @@ def ping_keepalive(portal_host, token):
         with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
             data = resp.read().decode("utf-8", errors="ignore")
             tokens = re.findall(r'keepalive\?([a-fA-F0-9]+)', data)
-            new_token = tokens[0] if tokens else token
-            return True, new_token
+            if tokens:
+                return True, tokens[0]
+            logging.debug(f"Keepalive ping response had no token from {portal_host}")
+            return False, None
     except Exception as e:
         logging.debug(f"Keepalive ping failed: {e}")
-        return False, token
+        return False, None
 
 def ensure_wifi_connected(cfg):
     """
@@ -448,15 +461,21 @@ def ensure_wifi_connected(cfg):
     if ip:
         return True
     
+    # Wait a couple seconds to allow macOS native auto-join to establish DHCP lease
+    time.sleep(2)
+    ip = get_wifi_ip(interface)
+    if ip:
+        return True
+
     ssids = cfg.get("preferred_ssids", ["Inha", "IUT"])
     for ssid in ssids:
         logging.info(f"Wi-Fi disconnected. Attempting association with '{ssid}' on {interface}...")
         try:
             subprocess.run(
                 ["networksetup", "-setairportnetwork", interface, ssid],
-                capture_output=True, timeout=10
+                capture_output=True, timeout=8
             )
-            time.sleep(3)
+            time.sleep(2)
             if get_wifi_ip(interface):
                 logging.info(f"Successfully associated with '{ssid}'!")
                 return True
@@ -495,20 +514,27 @@ def run_login_sequence(cfg, state):
 
     if not magic:
         logging.info("Probing portal to obtain magic token...")
-        try:
-            req = urllib.request.Request(
-                "http://neverssl.com",
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            with urllib.request.urlopen(req, timeout=4, context=get_ssl_context()) as resp:
-                data = resp.read().decode("utf-8", errors="ignore")
-                _, magic = extract_portal_info(resp.geturl(), data, gateway)
-        except urllib.error.HTTPError as e:
-            loc = e.headers.get("Location")
-            if loc:
-                _, magic = extract_portal_info(loc, "", gateway)
-        except Exception as e:
-            logging.debug(f"Failed to probe neverssl: {e}")
+        probe_urls = [
+            "http://captive.apple.com/hotspot-detect.html",
+            "http://detectportal.firefox.com/canonical.html",
+            "http://connectivitycheck.gstatic.com/generate_204",
+            "http://neverssl.com"
+        ]
+        probe_opener = urllib.request.build_opener(NoRedirectHandler(), urllib.request.HTTPSHandler(context=get_ssl_context()))
+        for p_url in probe_urls:
+            try:
+                req = urllib.request.Request(p_url, headers={"User-Agent": "Mozilla/5.0"})
+                with probe_opener.open(req, timeout=3) as resp:
+                    data = resp.read().decode("utf-8", errors="ignore")
+                    _, magic = extract_portal_info(resp.geturl(), data, gateway)
+            except urllib.error.HTTPError as e:
+                loc = e.headers.get("Location")
+                if loc:
+                    _, magic = extract_portal_info(loc, "", gateway)
+            except Exception as e:
+                logging.debug(f"Failed to probe {p_url}: {e}")
+            if magic:
+                break
 
     if not magic:
         logging.error(f"Could not obtain captive portal magic token from {portal_host}.")
@@ -573,10 +599,45 @@ def daemon_loop(cfg):
     last_keepalive_time = 0
     check_interval = cfg.get("check_interval_seconds", 30)
     keepalive_interval = cfg.get("keepalive_interval_seconds", 60)
+    interface = cfg.get("wifi_interface", "en0")
+    last_ip = get_wifi_ip(interface)
+    last_gateway = get_default_gateway()
+
+    # Initial check on daemon start
+    is_online, _, _ = check_internet()
+    if not is_online:
+        logging.info("Daemon started without internet. Triggering initial login sequence...")
+        run_login_sequence(cfg, state)
+        last_check_time = time.time()
+    else:
+        logging.info("Daemon started: Internet is already functional.")
+        last_check_time = time.time()
 
     while True:
         now = time.time()
-        
+        current_ip = get_wifi_ip(interface)
+        current_gateway = get_default_gateway()
+
+        # Immediate trigger on network reconnection or gateway change (e.g. after reboot / sleep / AP roam)
+        network_changed = False
+        if current_ip and (current_ip != last_ip or current_gateway != last_gateway):
+            logging.info(f"Network state changed (IP: {current_ip}, Gateway: {current_gateway}). Checking connectivity...")
+            network_changed = True
+            last_ip = current_ip
+            last_gateway = current_gateway
+        elif not current_ip and last_ip:
+            logging.info("Wi-Fi disconnected.")
+            last_ip = None
+            last_gateway = None
+
+        if network_changed:
+            is_online, _, _ = check_internet()
+            if not is_online:
+                logging.info("Captive portal detected after network change. Triggering login sequence...")
+                run_login_sequence(cfg, state)
+            last_check_time = now
+            last_keepalive_time = now
+
         # 1. Keepalive ping (keeps session alive so it never expires)
         if state.get("portal_host") and state.get("keepalive_token"):
             if now - last_keepalive_time >= keepalive_interval:
@@ -588,9 +649,11 @@ def daemon_loop(cfg):
                         state["keepalive_token"] = new_tok
                         save_state(state)
                 else:
-                    logging.debug("Keepalive failed; testing connectivity...")
+                    logging.info("Keepalive failed; testing connectivity...")
                     is_online, _, _ = check_internet()
                     if not is_online:
+                        state["keepalive_token"] = None
+                        save_state(state)
                         run_login_sequence(cfg, state)
 
         # 2. General connectivity check
@@ -619,6 +682,7 @@ def create_launchd_plist():
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
+        <string>-u</string>
         <string>{binary_path}</string>
         <string>--daemon</string>
     </array>
@@ -631,7 +695,7 @@ def create_launchd_plist():
     <key>StandardErrorPath</key>
     <string>{LOG_PATH}</string>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Interactive</string>
 </dict>
 </plist>
 """
@@ -699,7 +763,12 @@ def print_status():
         shell=True, capture_output=True, text=True
     ).stdout.strip()
     if launchctl_out:
-        print(f"Daemon Service : 🟢 Running (PID: {launchctl_out.split()[0]})")
+        parts = launchctl_out.split()
+        pid = parts[0]
+        if pid != "-" and pid.isdigit():
+            print(f"Daemon Service : 🟢 Running (PID: {pid})")
+        else:
+            print("Daemon Service : 🟡 Loaded (Waiting/Idle)")
     else:
         print("Daemon Service : ⚪ Stopped (Run 'inha-wifi start' to enable)")
     print("=" * 45)
