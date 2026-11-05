@@ -19,6 +19,7 @@ import urllib.error
 import http.cookiejar
 import logging
 import getpass
+import gzip
 
 CONFIG_DIR = os.path.expanduser("~/.config/inha-wifi")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -172,6 +173,21 @@ def get_wifi_ip(interface="en0"):
     except Exception:
         return None
 
+def read_response_body(resp):
+    """Safely reads and decompresses HTTP response body (gzip or plain text)."""
+    try:
+        raw = resp.read()
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    if resp.headers.get("Content-Encoding") == "gzip" or raw.startswith(b"\x1f\x8b"):
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+    return raw.decode("utf-8", errors="ignore")
+
 def check_internet():
     """
     Checks if device has real internet access.
@@ -179,52 +195,105 @@ def check_internet():
     """
     test_urls = [
         "http://captive.apple.com/hotspot-detect.html",
-        "http://firefox-portal-detection.com/generate_204",
         "http://connectivitycheck.gstatic.com/generate_204",
+        "http://detectportal.firefox.com/canonical.html",
         "http://neverssl.com"
     ]
     ctx = get_ssl_context()
     opener = urllib.request.build_opener(NoRedirectHandler(), urllib.request.HTTPSHandler(context=ctx))
 
+    last_redirect_url = None
+    last_content = ""
+
     for url in test_urls:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0"}
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
             )
             with opener.open(req, timeout=4) as resp:
                 final_url = resp.geturl()
-                content = resp.read().decode("utf-8", errors="ignore")
-                
-                # If captive portal redirected to https://gwd.inha.uz... or similar
+                content = read_response_body(resp)
+
+                # Explicit redirect in final_url to portal
                 if "inha.uz" in final_url or "fgtauth" in final_url or "keepalive" in final_url:
                     return False, final_url, content
-                
-                if resp.status == 204 or "Success" in content:
+
+                # Standard online responses
+                if "captive.apple.com" in url and resp.status == 200 and "Success" in content:
                     return True, final_url, content
-                
-                # Intercepted HTML without redirect (FortiGate serving portal script on port 80)
-                if "inha" in content.lower() or "fgtauth" in content.lower() or "welcome to iut" in content.lower():
+                if "generate_204" in url and resp.status == 204:
+                    return True, final_url, content
+                if "detectportal.firefox.com" in url and "success" in content.lower():
+                    return True, final_url, content
+
+                # Any other HTTP 200 on a probe endpoint is an intercepted captive portal page
+                if resp.status == 200:
                     return False, final_url, content
+
+                last_redirect_url = final_url
+                last_content = content
 
         except urllib.error.HTTPError as e:
             # Captive portal 301/302/303/307 redirection intercepted cleanly
             loc = e.headers.get("Location")
-            content = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
+            content = read_response_body(e) if hasattr(e, "read") else ""
             if loc:
                 return False, loc, content
+            last_content = content
         except Exception:
             pass
-            
-    return False, None, ""
+
+    return False, last_redirect_url, last_content
+
+def extract_magic(text):
+    """
+    Extracts FortiGate magic token from HTML content or redirection URL.
+    Supports all FortiOS portal templates, attributes, and script formats.
+    """
+    if not text:
+        return None
+
+    # 1. fgtauth?<token>
+    m = re.search(r'fgtauth\?([a-zA-Z0-9]+)', text)
+    if m:
+        return m.group(1)
+
+    # 2. <input ...> tag containing name="magic" and value="..." in any attribute order
+    for tag in re.finditer(r'<input\b[^>]*>', text, re.IGNORECASE):
+        tag_str = tag.group(0)
+        if re.search(r'name=[\'"]?magic[\'"]?', tag_str, re.IGNORECASE):
+            val_m = re.search(r'value=[\'"]([a-zA-Z0-9]+)[\'"]', tag_str, re.IGNORECASE)
+            if not val_m:
+                val_m = re.search(r'value=([a-zA-Z0-9]+)', tag_str, re.IGNORECASE)
+            if val_m:
+                return val_m.group(1)
+
+    # 3. URL query parameter: [?&]magic=...
+    m = re.search(r'[?&]magic=([a-zA-Z0-9]+)', text)
+    if m:
+        return m.group(1)
+
+    # 4. JavaScript variable assignment: magic = "..." or "magic": "..."
+    m = re.search(r'[\'"]?magic[\'"]?\s*[:=]\s*[\'"]([a-zA-Z0-9]+)[\'"]', text)
+    if m:
+        return m.group(1)
+
+    # 5. Generic hex token fallback in HTML if "magic" is mentioned
+    if "magic" in text.lower():
+        m = re.search(r'value=[\'"]([a-fA-F0-9]{16})[\'"]', text)
+        if m:
+            return m.group(1)
+
+    return None
 
 def extract_portal_info(redirect_url, html_content, gateway):
     """
     Extracts (portal_host, magic_token) from captive portal redirection.
-    Guarantees portal_host is never a probe domain.
+    Guarantees portal_host is never a probe domain and accurately maps subnets.
     """
     portal_host = None
-    magic_token = None
+    wifi_ip = get_wifi_ip()
 
     # 1. Search HTML for inha.uz hostname
     if html_content:
@@ -241,42 +310,26 @@ def extract_portal_info(redirect_url, html_content, gateway):
             if not is_probe and "inha.uz" in host:
                 portal_host = host
 
-    # 3. Use default gateway mapping
+    # 3. Subnet & gateway mapping
     if not portal_host:
         if gateway in KNOWN_PORTALS:
             portal_host = KNOWN_PORTALS[gateway]
-        elif gateway and gateway.startswith("172.18."):
+        elif (gateway and gateway.startswith("172.18.")) or (wifi_ip and wifi_ip.startswith("172.18.")):
             portal_host = "gwd.inha.uz:1003"
-        elif gateway and gateway.startswith("192.168."):
+        elif (gateway and gateway.startswith("192.168.")) or (wifi_ip and wifi_ip.startswith("192.168.")):
             portal_host = "gw-iut.inha.uz:1003"
         else:
-            portal_host = "gwd.inha.uz:1003"
+            portal_host = None
 
-    if ":" not in portal_host:
+    if portal_host and ":" not in portal_host:
         portal_host += ":1003"
 
     # 4. Extract magic token
-    to_search = []
-    if html_content:
-        to_search.append(html_content)
-    if redirect_url:
-        to_search.append(redirect_url)
-
-    for text in to_search:
-        # Check query string like /fgtauth?00497603dade32b1
-        m = re.search(r'fgtauth\?([a-fA-F0-9]{16})', text)
-        if m:
-            magic_token = m.group(1)
-            break
-        # Check <input ... name="magic" value="...">
-        m = re.search(r'name=["\']magic["\']\s+value=["\']([a-fA-F0-9]+)["\']', text)
-        if m:
-            magic_token = m.group(1)
-            break
-        # General query match: magic=...
-        m = re.search(r'[?&]magic=([a-fA-F0-9]+)', text)
-        if m:
-            magic_token = m.group(1)
+    magic_token = None
+    for text in (html_content, redirect_url):
+        tok = extract_magic(text)
+        if tok:
+            magic_token = tok
             break
 
     return portal_host, magic_token
@@ -311,7 +364,7 @@ def perform_login(portal_host, magic_token, username, password):
     try:
         req = urllib.request.Request(portal_get_url, headers=browser_headers)
         with opener.open(req, timeout=8) as resp:
-            login_html = resp.read().decode("utf-8", errors="ignore")
+            login_html = read_response_body(resp)
             logging.info(f"Loaded portal page successfully ({len(login_html)} bytes).")
     except Exception as e:
         logging.warning(f"GET to {portal_get_url} returned: {e}")
@@ -368,7 +421,7 @@ def perform_login(portal_host, magic_token, username, password):
         try:
             req = urllib.request.Request(target, data=encoded_data, headers=post_headers, method="POST")
             with opener.open(req, timeout=10) as resp:
-                resp_data = resp.read().decode("utf-8", errors="ignore")
+                resp_data = read_response_body(resp)
                 final_url = resp.geturl()
                 
                 # Check for keepalive token
@@ -442,7 +495,7 @@ def ping_keepalive(portal_host, token):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
-            data = resp.read().decode("utf-8", errors="ignore")
+            data = read_response_body(resp)
             tokens = re.findall(r'keepalive\?([a-fA-F0-9]+)', data)
             if tokens:
                 return True, tokens[0]
@@ -512,25 +565,46 @@ def run_login_sequence(cfg, state):
     gateway = get_default_gateway()
     portal_host, magic = extract_portal_info(redir_url, content, gateway)
 
+    # Check if this is an external / non-Inha network
+    if not portal_host:
+        logging.info("External or non-Inha network detected; skipping captive login.")
+        return False
+
     if not magic:
         logging.info("Probing portal to obtain magic token...")
-        probe_urls = [
+        probe_urls = []
+        if gateway and (gateway.startswith("192.168.") or gateway.startswith("172.18.")):
+            probe_urls.append(f"http://{gateway}/")
+        if portal_host:
+            probe_urls.append(f"http://{portal_host.split(':')[0]}/")
+        probe_urls.extend([
             "http://captive.apple.com/hotspot-detect.html",
-            "http://detectportal.firefox.com/canonical.html",
             "http://connectivitycheck.gstatic.com/generate_204",
+            "http://detectportal.firefox.com/canonical.html",
             "http://neverssl.com"
-        ]
+        ])
+
         probe_opener = urllib.request.build_opener(NoRedirectHandler(), urllib.request.HTTPSHandler(context=get_ssl_context()))
         for p_url in probe_urls:
             try:
-                req = urllib.request.Request(p_url, headers={"User-Agent": "Mozilla/5.0"})
+                req = urllib.request.Request(p_url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
                 with probe_opener.open(req, timeout=3) as resp:
-                    data = resp.read().decode("utf-8", errors="ignore")
-                    _, magic = extract_portal_info(resp.geturl(), data, gateway)
+                    data = read_response_body(resp)
+                    p_host, p_magic = extract_portal_info(resp.geturl(), data, gateway)
+                    if not portal_host and p_host:
+                        portal_host = p_host
+                    if p_magic:
+                        magic = p_magic
+                        break
             except urllib.error.HTTPError as e:
                 loc = e.headers.get("Location")
-                if loc:
-                    _, magic = extract_portal_info(loc, "", gateway)
+                data = read_response_body(e) if hasattr(e, "read") else ""
+                p_host, p_magic = extract_portal_info(loc, data, gateway)
+                if not portal_host and p_host:
+                    portal_host = p_host
+                if p_magic:
+                    magic = p_magic
+                    break
             except Exception as e:
                 logging.debug(f"Failed to probe {p_url}: {e}")
             if magic:
@@ -569,31 +643,6 @@ def daemon_loop(cfg):
     logging.info("Starting Inha/IUT Wi-Fi background autologin service...")
     setup_urllib()
     state = load_state()
-    
-    # Try to grab current keepalive token from existing session if state is empty
-    if not state.get("keepalive_token") and get_default_gateway() in KNOWN_PORTALS:
-        state["portal_host"] = KNOWN_PORTALS[get_default_gateway()]
-        try:
-            ff_hist = os.path.expanduser("~/Library/Application Support/Firefox/Profiles")
-            for root, dirs, files in os.walk(ff_hist):
-                if "places.sqlite" in files:
-                    db_path = os.path.join(root, "places.sqlite")
-                    tmp_db = "/tmp/places_tmp.sqlite"
-                    subprocess.run(["cp", db_path, tmp_db], capture_output=True)
-                    cmd = f"sqlite3 '{tmp_db}' \"SELECT url FROM moz_places WHERE url LIKE '%keepalive%' ORDER BY last_visit_date DESC LIMIT 1;\" 2>/dev/null"
-                    out = subprocess.check_output(cmd, shell=True, text=True).strip()
-                    try:
-                        os.remove(tmp_db)
-                    except Exception:
-                        pass
-                    m = re.search(r'keepalive\?([a-fA-F0-9]+)', out)
-                    if m:
-                        state["keepalive_token"] = m.group(1)
-                        save_state(state)
-                        logging.info(f"Recovered keepalive token from Firefox history: {state['keepalive_token']}")
-                        break
-        except Exception as e:
-            logging.debug(f"History recovery error: {e}")
 
     last_check_time = 0
     last_keepalive_time = 0
@@ -742,6 +791,10 @@ def print_status():
     if gateway in KNOWN_PORTALS:
         location = "Dormitory" if "gwd" in KNOWN_PORTALS[gateway] else "Campus"
         print(f"Location       : {location} ({KNOWN_PORTALS[gateway]})")
+    elif (gateway and gateway.startswith("172.18.")) or (ip and ip.startswith("172.18.")):
+        print(f"Location       : Dormitory (gwd.inha.uz:1003)")
+    elif (gateway and gateway.startswith("192.168.")) or (ip and ip.startswith("192.168.")):
+        print(f"Location       : Campus (gw-iut.inha.uz:1003)")
     else:
         print(f"Location       : External / Other network")
         
